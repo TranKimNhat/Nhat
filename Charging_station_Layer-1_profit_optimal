@@ -1,0 +1,307 @@
+# EV Charging Station - Layer 1 Optimization (Day-Ahead Scheduling)
+# Objective: Maximize Net Profit (Revenue - Costs - Penalties)
+#
+# Assumptions for this version:
+# - All prices are in VND/kWh (grid buy/sell AND EV tariff ptev)
+# - Time-step Δt = 0.5 h (30 minutes)
+# - Unmet_penalty is a CONSTANT (VND/kWh)
+#
+# Expected columns in input_profiles.xlsx (VNĐ/kWh):
+#   "PV Sunny (kW)"
+#   "EV Forecast Low Error (kW)"   (đổi tên cho phù hợp nếu bạn dùng cột khác)
+#   "Price Buy (VND/kWh)"
+#   "Price Sell (VND/kWh)"
+#   "Time (h)"  (tùy chọn)
+
+import pandas as pd
+import numpy as np
+from pyomo.environ import (
+    ConcreteModel, RangeSet, Var, NonNegativeReals, Binary,
+    Constraint, Objective, maximize, SolverFactory, value
+)
+
+# === Step 1: Load input data ===
+df = pd.read_excel("input_profiles.xlsx")
+T = len(df)
+
+# === Step 2: Parameters from data (VND/kWh) ===
+# Đổi tên cột bên dưới cho khớp file input_profiles.xlsx
+PV_series = df["PV Sunny (kW)"].tolist()
+EV_series = df["EV Charge (kW)"].tolist()
+price_buy_kwh  = df["Price Buy (VND/kWh)"].astype(float).tolist()
+price_sell_kwh = df["Price Sell (VND/kWh)"].astype(float).tolist()
+
+# === Step 3: Constants and assumptions ===
+Delta_t = 0.25           # [h] 15-minute time step
+C_BESS = 1000.0          # [kWh]
+C_rate = 0.5            # [1/h] -> P_max = C_rate * C_BESS [kW]
+eta_ch = 0.95
+eta_dch = 0.95
+P_grid_max = 1000.0      # [kW]
+SoC_min = 0.2 * C_BESS  # [kWh]
+SoC_max = 1.0 * C_BESS  # [kWh]
+SoC_initial = 0.50 * C_BESS
+
+# EV tariff (revenue from charging customers), VND/kWh
+PTEV_VND_PER_KWH = 3858.0
+
+# Unmet penalty as a CONSTANT in VND/kWh (giữ nguyên là hằng số)
+UNMET_PENALTY_VND_PER_KWH = 1000.0  # điều chỉnh 
+
+# Big-M parameters
+M_grid = P_grid_max
+P_bess_max = C_rate * C_BESS
+M_bess = P_bess_max
+
+# === Step 4: Build model ===
+m = ConcreteModel()
+m.T = RangeSet(0, T - 1)
+
+# Decision variables
+# Grid interaction (mutually exclusive via binary)
+m.P_grid_buy = Var(m.T, domain=NonNegativeReals)   # [kW]
+m.P_grid_sell = Var(m.T, domain=NonNegativeReals)  # [kW]
+m.is_buy = Var(m.T, domain=Binary)
+
+# BESS charge/discharge split (mutually exclusive via binary)
+m.P_bess_ch  = Var(m.T, domain=NonNegativeReals)   # [kW]
+m.P_bess_dch = Var(m.T, domain=NonNegativeReals)   # [kW]
+m.is_ch = Var(m.T, domain=Binary)
+
+# SoC and unmet EV demand
+m.SoC = Var(m.T, bounds=(SoC_min, SoC_max))        # [kWh]
+m.EV_unmet = Var(m.T, domain=NonNegativeReals)     # [kW]
+
+# === Step 5: Constraints ===
+
+# Grid limits & exclusivity
+def grid_buy_limit_rule(_m, t):
+    return _m.P_grid_buy[t] <= M_grid * _m.is_buy[t]
+m.grid_buy_limit = Constraint(m.T, rule=grid_buy_limit_rule)
+
+def grid_sell_limit_rule(_m, t):
+    return _m.P_grid_sell[t] <= M_grid * (1 - _m.is_buy[t])
+m.grid_sell_limit = Constraint(m.T, rule=grid_sell_limit_rule)
+
+def grid_buy_cap_rule(_m, t):
+    return _m.P_grid_buy[t] <= P_grid_max
+m.grid_buy_cap = Constraint(m.T, rule=grid_buy_cap_rule)
+
+def grid_sell_cap_rule(_m, t):
+    return _m.P_grid_sell[t] <= P_grid_max
+m.grid_sell_cap = Constraint(m.T, rule=grid_sell_cap_rule)
+
+# BESS limits & exclusivity
+def bess_ch_limit_rule(_m, t):
+    return _m.P_bess_ch[t] <= M_bess * _m.is_ch[t]
+m.bess_ch_limit = Constraint(m.T, rule=bess_ch_limit_rule)
+
+def bess_dch_limit_rule(_m, t):
+    return _m.P_bess_dch[t] <= M_bess * (1 - _m.is_ch[t])
+m.bess_dch_limit = Constraint(m.T, rule=bess_dch_limit_rule)
+
+# SoC dynamics
+def soc_init_rule(_m, t):
+    if t == 0:
+        return _m.SoC[t] == SoC_initial + Delta_t * (
+            eta_ch * _m.P_bess_ch[t] - _m.P_bess_dch[t] / eta_dch
+        )
+    return Constraint.Skip
+m.soc_init = Constraint(m.T, rule=soc_init_rule)
+
+def soc_balance_rule(_m, t):
+    if t >= 1:
+        return _m.SoC[t] == _m.SoC[t-1] + Delta_t * (
+            eta_ch * _m.P_bess_ch[t] - _m.P_bess_dch[t] / eta_dch
+        )
+    return Constraint.Skip
+m.soc_balance = Constraint(m.T, rule=soc_balance_rule)
+
+# Power balance at each time step (kW)
+# PV + grid_buy - grid_sell + BESS_dch - BESS_ch = EV_demand - EV_unmet
+def power_balance_rule(_m, t):
+    PV_t = PV_series[t]
+    EV_t = EV_series[t]
+    return (
+        PV_t + _m.P_grid_buy[t] - _m.P_grid_sell[t]
+        + _m.P_bess_dch[t] - _m.P_bess_ch[t]
+        == EV_t - _m.EV_unmet[t]
+    )
+m.power_balance = Constraint(m.T, rule=power_balance_rule)
+
+# Terminal SoC neutrality (day-ahead)
+def terminal_soc_rule(_m):
+    return _m.SoC[T-1] == SoC_initial
+m.terminal_soc = Constraint(rule=terminal_soc_rule)
+
+# === Step 6: Objective function — MAXIMIZE NET PROFIT ===
+# Profit_t = [ (EV_met * ptev) + (sell * price_sell) - (buy * price_buy) - (unmet * penalty) ] * Δt
+def profit_expr(_m):
+    total = 0.0
+    for t in _m.T:
+        EV_met_kw = EV_series[t] - _m.EV_unmet[t]  # [kW]
+        total += (
+            EV_met_kw * PTEV_VND_PER_KWH
+            + _m.P_grid_sell[t] * price_sell_kwh[t]
+            - _m.P_grid_buy[t] * price_buy_kwh[t]
+            - _m.EV_unmet[t] * UNMET_PENALTY_VND_PER_KWH
+        ) * Delta_t
+    return total
+
+m.objective = Objective(rule=profit_expr, sense=maximize)
+
+# === Step 7: Solve ===
+results = None
+solver = None
+for cand in ["gurobi", "glpk"]:
+    try:
+        solver = SolverFactory(cand)
+        results = solver.solve(m, tee=False)
+        break
+    except Exception:
+        solver = None
+        results = None
+
+if results is None:
+    raise RuntimeError("No suitable MILP solver found. Please install 'glpk' or 'gurobi'.")
+
+# === Step 8: Save results (+ profit breakdown) ===
+time_col = df["Time (h)"] if "Time (h)" in df.columns else list(range(T))
+
+P_buy  = [value(m.P_grid_buy[t])  for t in m.T]
+P_sell = [value(m.P_grid_sell[t]) for t in m.T]
+P_ch   = [value(m.P_bess_ch[t])   for t in m.T]
+P_dch  = [value(m.P_bess_dch[t])  for t in m.T]
+SoC    = [value(m.SoC[t])         for t in m.T]
+EV_unm = [value(m.EV_unmet[t])    for t in m.T]
+EV_met = [EV_series[t] - EV_unm[t] for t in range(T)]
+
+rev_ev   = [EV_met[t] * PTEV_VND_PER_KWH * Delta_t for t in range(T)]
+rev_sell = [P_sell[t] * price_sell_kwh[t] * Delta_t for t in range(T)]
+cost_buy = [P_buy[t]  * price_buy_kwh[t]  * Delta_t for t in range(T)]
+penalty  = [EV_unm[t] * UNMET_PENALTY_VND_PER_KWH * Delta_t for t in range(T)]
+profit_step = [rev_ev[t] + rev_sell[t] - cost_buy[t] - penalty[t] for t in range(T)]
+profit_cum  = list(np.cumsum(profit_step))
+
+# === Step 9: Save results to 5 sheets (use out_* dataframes) ===
+
+# --- Sheet 1: Input (Time, PV Sunny, EV demand)
+out_input = pd.DataFrame({
+    "Time (h)":       time_col,
+    "PV Sunny (kW)":   PV_series,
+    "EV demand (kW)":  EV_series,
+})
+
+# --- Sheet 2: Results (đúng thứ tự yêu cầu)
+out_results = pd.DataFrame({
+    "Time (h)":         time_col,
+    "PV (kW)":          PV_series,
+    "EV demand (kW)":   EV_series,
+    "P_grid_buy (kW)":  P_buy,
+    "P_grid_sell (kW)": P_sell,
+    "P_grid_net (kW)":  [P_buy[t] - P_sell[t] for t in range(T)],
+    "P_BESS_ch (kW)":   P_ch,
+    "P_BESS_dch (kW)":  P_dch,
+    "P_BESS_net (kW)":  [P_dch[t] - P_ch[t] for t in range(T)],
+    "EV unmet (kW)":    EV_unm,
+    "EV served (kW)":   EV_met,
+    "SoC (kWh)":        SoC,
+})
+
+# --- Sheet 3: Status
+out_status = pd.DataFrame({
+    "is_buy (bin)": [int(round(value(m.is_buy[t]))) for t in m.T],
+    "is_ch (bin)":  [int(round(value(m.is_ch[t])))  for t in m.T],
+})
+
+# --- Sheet 4: Economic (per step)
+out_economic = pd.DataFrame({
+    "Rev_EV (VND)":         rev_ev,
+    "Rev_grid_sell (VND)":  rev_sell,
+    "Cost_grid_buy (VND)":  cost_buy,
+    "Penalty_unmet (VND)":  penalty,
+    "Profit_step (VND)":    profit_step,
+    "Profit_cum (VND)":     profit_cum,
+})
+
+# --- Sheet 5: Economic Summary (2 cột: Metric, Value)
+summary_dict = {
+    "Total Rev_EV (VND)":         float(np.sum(rev_ev)),
+    "Total Rev_grid_sell (VND)":  float(np.sum(rev_sell)),
+    "Total Cost_grid_buy (VND)":  float(np.sum(cost_buy)),
+    "Total Penalty_unmet (VND)":  float(np.sum(penalty)),
+    "Total Profit (VND)":         float(profit_cum[-1] if len(profit_cum) else 0.0),
+}
+out_summary = pd.DataFrame({
+    "Metric": list(summary_dict.keys()),
+    "Value":  list(summary_dict.values()),
+})
+
+# --- Write to Excel (cố gắng qua nhiều engine)
+string1="_grid"+str(value(P_grid_max));
+string2="_SOCinit"+str(value(SoC_initial));
+OUTPUT_PATH = "layer1_results_profit"+string1+string2+".xlsx"
+_written = False
+for eng in [None, "xlsxwriter", "openpyxl"]:
+    try:
+        with pd.ExcelWriter(OUTPUT_PATH, engine=eng) as w:
+            out_input.to_excel(w,    sheet_name="Input",            index=False)
+            out_results.to_excel(w,  sheet_name="Results",          index=False)
+            out_status.to_excel(w,   sheet_name="Status",           index=False)
+            out_economic.to_excel(w, sheet_name="Economic",         index=False)
+            out_summary.to_excel(w,  sheet_name="Economic Summary", index=False)
+        _written = True
+        break
+    except Exception:
+        continue
+
+if _written:
+    print(f"Optimization complete. Results saved to {OUTPUT_PATH}")
+else:
+    raise RuntimeError(
+        "Could not write Excel. Please install 'xlsxwriter' or 'openpyxl'.\n"
+        "Conda:   conda install -n myenv xlsxwriter openpyxl\n"
+        "Pip:     pip install xlsxwriter openpyxl"
+    )
+# === Step 10: Plot results ===
+import matplotlib.pyplot as plt
+
+plt.rcParams.update({
+    "font.size": 16,           # Increase global font size
+    "font.family": "sans-serif",
+    "axes.labelweight": "bold" # Bold axis labels
+})
+
+plt.figure(figsize=(14, 8)) 
+plt.plot(time_col, PV_series, color='green', label="PV (kW)", linewidth=2)
+plt.plot(time_col, EV_series, color='blue', label="EV Demand (kW)", linewidth=2)
+plt.plot(time_col, P_buy, color='black', label="P_grid_buy (kW)", linewidth=2)
+plt.plot(time_col, P_sell, color='orange', label="P_grid_sell (kW)", linewidth=2)
+plt.plot(time_col, P_ch, color='purple', label="P_BESS_charge (kW)", linewidth=2)
+plt.plot(time_col, P_dch, color='red', label="P_BESS_discharge (kW)", linewidth=2)
+
+plt.xlabel("Time (h)", fontsize=18, fontweight='bold')
+plt.ylabel("Power (kW)", fontsize=18, fontweight='bold')
+plt.title("Optimal Power Flows", fontsize=20, fontweight='bold')
+plt.grid(True)
+plt.tight_layout()
+
+# Show only every 2 or 3 hours for clarity
+hour_ticks = []
+hour_labels = []
+for i, t in enumerate(time_col):
+    # If t is string like "00:00", "01:00", etc.
+    if isinstance(t, str) and (":00" in t or t.endswith(":00")):
+        hour_ticks.append(i)
+        hour_labels.append(t)
+    # If t is numeric and integer hour
+    elif isinstance(t, (int, float)) and np.isclose(t % 1, 0):
+        hour_ticks.append(i)
+        hour_labels.append(f"{int(t):02d}:00")
+plt.xticks(hour_ticks, hour_labels, rotation=90, fontsize=16, fontweight='bold')
+
+plt.legend(loc='upper center', bbox_to_anchor=(0.5, -0.18), ncol=3, frameon=False, fontsize=16)
+plt.subplots_adjust(bottom=0.32)  # More space for bigger labels
+
+plt.savefig("power flows.png", dpi=300, bbox_inches='tight')  # Save the figure
+plt.show()
